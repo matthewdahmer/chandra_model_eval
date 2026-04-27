@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chandra_model_eval"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "xija",
+    "cxotime",
+    "cheta",
+    "kadi",
+]
+
+[project.scripts]
+chandra-model-eval = "chandra_model_eval.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chandra_model_eval*"]
