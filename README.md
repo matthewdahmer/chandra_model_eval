@@ -159,6 +159,8 @@ Use this to assess how well the model matches historical telemetry.
 result = model.evaluate('2025:001', '2025:090')
 ```
 
+Internally the model is run starting 7 days before `tstart` so that errors from the initial conditions have time to wash out. The 7-day warm-up period is discarded before the `ModelResult` is returned — all arrays, statistics, and analytics contain only data within the requested `tstart`/`tstop` window.
+
 ## Working with `ModelResult`
 
 `evaluate()` returns a `ModelResult` dataclass with the following fields:
@@ -166,9 +168,9 @@ result = model.evaluate('2025:001', '2025:090')
 | Field | Type | Description |
 |---|---|---|
 | `msid` | str | MSID name |
-| `times` | ndarray | Model time array in CXC seconds |
-| `predicted` | ndarray | Model-predicted temperatures |
-| `observed` | ndarray | Telemetry temperatures |
+| `times` | ndarray | Model time array in CXC seconds, clipped to the requested window |
+| `predicted` | ndarray | Model-predicted temperatures, clipped to the requested window |
+| `observed` | ndarray | Telemetry temperatures, clipped to the requested window |
 | `limit` | float | Active planning warning limit |
 | `limit_type` | str | `'max'` or `'min'` |
 | `all_limits` | dict | All limit entries from the spec (same as on the model instance) |
@@ -243,6 +245,8 @@ from chandra_model_eval import export_result
 export_result(result, '/data/model_eval/1dpamzt.json.gz')
 ```
 
+See `file_structure.md` for a complete annotated reference of every key in the output file, including interpretation guidance for each field. The sections below give a structural overview.
+
 The file contains:
 
 ### Model identity and limits
@@ -269,10 +273,12 @@ The file contains:
 |---|---|---|
 | `datestart` | string | Chandra date string (`YYYY:DDD:HH:MM:SS.sss`) of the first time step |
 | `datestop` | string | Chandra date string of the last time step |
-| `times` | array of numbers | CXC seconds for every time step |
+| `times` | array of numbers | CXC seconds for every time step, spanning exactly the requested window |
 | `predicted` | array of numbers/null | Model-predicted temperatures; null where not finite |
 | `observed` | array of numbers/null | Telemetry temperatures; null where not finite |
 | `residuals` | array of numbers/null | observed − predicted; null where not finite |
+
+> All time-series arrays are clipped to the requested `tstart`/`tstop`. The model is run internally with a 7-day warm-up period before `tstart` to eliminate initial-condition transients; that warm-up data is discarded and does not appear in the file.
 
 ### Summary statistics
 

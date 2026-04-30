@@ -223,8 +223,12 @@ class ChandraModel:
             self.msid, start=tstart, stop=tstop, model_spec=self.model_spec
         )
 
-    def _compute_pitch_data(self, tstart, tstop, model, comp):
+    def _compute_pitch_data(self, tstart, tstop, model, times, dvals, mvals):
         """Return pitch-binned data, per-dwell table, and analytics.
+
+        times, dvals, and mvals must already be clipped to the requested tstart/tstop
+        (burn-in period excluded). tstart/tstop are still the original requested window,
+        used to fetch kadi state data for the same interval.
 
         Returns (plist, metadata, telem_segments, err_segments, segment_norm, telem_bounds,
                  pitch_bin_statistics, dwell_table, analytics).
@@ -234,12 +238,12 @@ class ChandraModel:
         try:
             plist = get_pitch_midpoints(model)
             if not plist:
-                telem_bounds = (float(np.nanmin(comp.dvals)), float(np.nanmax(comp.dvals)))
+                telem_bounds = (float(np.nanmin(dvals)), float(np.nanmax(dvals)))
                 return [], *_empty, telem_bounds
             state_data = get_npnt_state_data(tstart, tstop)
-            error = comp.dvals - comp.mvals
+            error = dvals - mvals
             metadata, telem_segments, err_segments, segment_norm, telem_bounds = \
-                bin_data_by_pitch(state_data, plist, model.times, comp.dvals, error)
+                bin_data_by_pitch(state_data, plist, times, dvals, error)
             pitch_bin_statistics = compute_pitch_bin_statistics(telem_segments, err_segments)
             dwell_table = build_dwell_table(
                 metadata, telem_segments, err_segments, segment_norm, telem_bounds
@@ -251,7 +255,7 @@ class ChandraModel:
                     pitch_bin_statistics, dwell_table, analytics)
         except Exception as exc:
             logger.warning('pitch data computation failed for %s: %s', self.msid, exc)
-            telem_bounds = (float(np.nanmin(comp.dvals)), float(np.nanmax(comp.dvals)))
+            telem_bounds = (float(np.nanmin(dvals)), float(np.nanmax(dvals)))
             return [], *_empty, telem_bounds
 
     def _compute_solar_params(self, model):
@@ -280,26 +284,43 @@ class ChandraModel:
         Pseudo-nodes are initialized from model_init. The primary MSID node is
         left unset so xija fetches real telemetry, making dvals the observed
         reference and mvals the model prediction for accuracy assessment.
+
+        The model is run starting 7 days before tstart to allow initial conditions
+        to wash out. All output arrays, statistics, and analytics are clipped to
+        the requested tstart/tstop window before being returned or written to file.
         """
-        model = self._build(tstart, tstop)
+        from cxotime import CxoTime
+
+        BURN_IN_DAYS = 7
+        tstart_cxc = CxoTime(tstart).secs
+        tstart_burn = CxoTime(tstart_cxc - BURN_IN_DAYS * 86400.0).date
+
+        model = self._build(tstart_burn, tstop)
         for key, val in self.model_init.items():
             if key != self.msid:
                 model.comp[key].set_data(val)
         model.make()
         model.calc()
         comp = model.comp[self.msid]
+
+        # Clip burn-in period — keep only times within the requested window
+        clip = model.times >= tstart_cxc
+        times  = model.times[clip].copy()
+        mvals  = comp.mvals[clip].copy()
+        dvals  = comp.dvals[clip].copy()
+
         spec_md5, spec_github_url, spec_github_release = self._spec_info()
 
         plist, metadata, telem_segments, err_segments, segment_norm, telem_bounds, \
             pitch_bin_statistics, dwell_table, analytics = \
-            self._compute_pitch_data(tstart, tstop, model, comp)
+            self._compute_pitch_data(tstart, tstop, model, times, dvals, mvals)
         solar_params, p_names, dp_names = self._compute_solar_params(model)
 
         return ModelResult(
             msid=self.msid,
-            times=model.times.copy(),
-            predicted=comp.mvals.copy(),
-            observed=comp.dvals.copy(),
+            times=times,
+            predicted=mvals,
+            observed=dvals,
             limit=self.limit,
             limit_type=self.limit_type,
             all_limits=self.all_limits,
