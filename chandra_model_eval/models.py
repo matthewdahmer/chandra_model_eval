@@ -14,9 +14,10 @@ from .calc_model_data import (
     build_dwell_table,
     compute_analytics,
     compute_pitch_bin_statistics,
+    get_dpa_power_params,
     get_npnt_state_data,
     get_pitch_midpoints,
-    get_solarheat_params,
+    get_solarheat_components,
 )
 
 import numpy as np
@@ -68,10 +69,12 @@ class ModelResult:
     # per-dwell table and high-level analytics
     dwell_table: dict = field(default_factory=dict)
     analytics: dict = field(default_factory=dict)
-    # solarheat parameters from the model spec
-    solar_params: dict = field(default_factory=dict)
-    p_names: list = field(default_factory=list)
-    dp_names: list = field(default_factory=list)
+    # solarheat components from the model spec
+    solar_heat_components: list = field(default_factory=list)
+    # dpa power lookup table (empty dict if model has no dpa_power parameters)
+    dpa_power: dict = field(default_factory=dict)
+    # model component inputs: {component_name: array} for every component with dvals
+    inputs: dict = field(default_factory=dict)
 
     @property
     def residuals(self):
@@ -133,7 +136,14 @@ class ChandraModel:
     model_init includes the primary MSID node so that run() can set its initial
     condition (planning mode). During evaluate(), only pseudo-nodes are initialized
     and the primary MSID auto-fetches from the telemetry archive.
+
+    Class attributes:
+        extra_dwell_msids   list of cheta MSID names whose median value over each
+                            dwell should be added to the dwell table. Override in
+                            subclasses that need model-specific columns.
     """
+
+    extra_dwell_msids = []
 
     def __repr__(self):
         return (
@@ -236,6 +246,7 @@ class ChandraModel:
         """
         _empty = ({}, {}, {}, {}, {}, {}, {})
         try:
+            from cheta import fetch_eng
             plist = get_pitch_midpoints(model)
             if not plist:
                 telem_bounds = (float(np.nanmin(dvals)), float(np.nanmax(dvals)))
@@ -245,8 +256,36 @@ class ChandraModel:
             metadata, telem_segments, err_segments, segment_norm, telem_bounds = \
                 bin_data_by_pitch(state_data, plist, times, dvals, error)
             pitch_bin_statistics = compute_pitch_bin_statistics(telem_segments, err_segments)
+
+            # Fetch dist_sat_earth for the evaluation window
+            dist_sat_earth = None
+            try:
+                dse = fetch_eng.MSID('dist_satearth', tstart, tstop, filter_bad=True)
+                if len(dse.times) > 0:
+                    dist_sat_earth = (dse.times, dse.vals)
+            except Exception as exc:
+                logger.warning('dist_satearth fetch failed for %s: %s', self.msid, exc)
+
+            # Fetch any model-specific extra MSIDs
+            extra_msid_data = None
+            if self.extra_dwell_msids:
+                extra_msid_data = {}
+                for msid_name in self.extra_dwell_msids:
+                    try:
+                        dat = fetch_eng.MSID(msid_name, tstart, tstop, filter_bad=True)
+                        if len(dat.times) > 0:
+                            vals = dat.raw_vals.copy()
+                            if msid_name in ('224pcast', '215pcast'):
+                                vals = 1 - vals
+                            extra_msid_data[msid_name] = (dat.times, vals)
+                    except Exception as exc:
+                        logger.warning('extra MSID fetch failed for %s/%s: %s',
+                                       self.msid, msid_name, exc)
+
             dwell_table = build_dwell_table(
-                metadata, telem_segments, err_segments, segment_norm, telem_bounds
+                metadata, telem_segments, err_segments, segment_norm, telem_bounds,
+                dist_sat_earth=dist_sat_earth,
+                extra_msid_data=extra_msid_data,
             )
             analytics = compute_analytics(
                 dwell_table, telem_bounds, self.limit, self.limit_type
@@ -259,15 +298,20 @@ class ChandraModel:
             return [], *_empty, telem_bounds
 
     def _compute_solar_params(self, model):
-        """Return (solar_params, p_names, dp_names) from the model's solarheat parameters.
-
-        Falls back to empty structures and logs a warning on any failure.
-        """
+        """Return list of solarheat component dicts. Falls back to [] on failure."""
         try:
-            return get_solarheat_params(model)
+            return get_solarheat_components(model)
         except Exception as exc:
             logger.warning('solar param extraction failed for %s: %s', self.msid, exc)
-            return {}, [], []
+            return []
+
+    def _compute_dpa_power(self, model):
+        """Return dpa_power lookup dict. Falls back to {} on failure."""
+        try:
+            return get_dpa_power_params(model)
+        except Exception as exc:
+            logger.warning('dpa_power extraction failed for %s: %s', self.msid, exc)
+            return {}
 
     def run(self, tstart, tstop):
         """Run model in planning mode — all model_init values set, including the primary node."""
@@ -309,12 +353,24 @@ class ChandraModel:
         mvals  = comp.mvals[clip].copy()
         dvals  = comp.dvals[clip].copy()
 
+        # Collect dvals for every component that has a full-length array
+        inputs = {}
+        n_times = len(model.times)
+        for comp_name, c in model.comp.items():
+            try:
+                dv = c.dvals
+                if dv is not None and len(dv) == n_times:
+                    inputs[comp_name] = dv[clip].copy()
+            except Exception:
+                pass
+
         spec_md5, spec_github_url, spec_github_release = self._spec_info()
 
         plist, metadata, telem_segments, err_segments, segment_norm, telem_bounds, \
             pitch_bin_statistics, dwell_table, analytics = \
             self._compute_pitch_data(tstart, tstop, model, times, dvals, mvals)
-        solar_params, p_names, dp_names = self._compute_solar_params(model)
+        solar_heat_components = self._compute_solar_params(model)
+        dpa_power = self._compute_dpa_power(model)
 
         return ModelResult(
             msid=self.msid,
@@ -337,9 +393,9 @@ class ChandraModel:
             pitch_bin_statistics=pitch_bin_statistics,
             dwell_table=dwell_table,
             analytics=analytics,
-            solar_params=solar_params,
-            p_names=p_names,
-            dp_names=dp_names,
+            solar_heat_components=solar_heat_components,
+            dpa_power=dpa_power,
+            inputs=inputs,
         )
 
 
@@ -506,6 +562,8 @@ class ModelPM2THV1T(ChandraModel):
 
 
 class Model2CEAHVPT(ChandraModel):
+    extra_dwell_msids = ['2imonst', '2sponst', '2s2onst', '224pcast', '215pcast', 'aoeclips']
+
     def __init__(self, model_spec, limit=None):
         self.msid = '2ceahvpt'
         self.limit_type = 'max'
@@ -600,9 +658,13 @@ def export_result(result, path):
     def _serialize_segment_norm(sn):
         return {str(bin_idx): [float(v) for v in vals] for bin_idx, vals in sn.items()}
 
-    def _serialize_solar_params(sp):
-        return {name: [[str(pitch), float(val)] for pitch, val in vals]
-                for name, vals in sp.items()}
+    def _input_array(arr):
+        if np.issubdtype(arr.dtype, np.floating):
+            return [v if np.isfinite(v) else None for v in arr.tolist()]
+        if arr.dtype == np.bool_:
+            return arr.astype(np.int8).tolist()
+        return arr.tolist()
+
 
     viol = result.violations()
 
@@ -649,9 +711,11 @@ def export_result(result, path):
         # --- high-level analytics ---
         'analytics': result.analytics,
         # --- solarheat model parameters ---
-        'solar_params': _serialize_solar_params(result.solar_params),
-        'p_names':      result.p_names,
-        'dp_names':     result.dp_names,
+        'solar_heat_components': result.solar_heat_components,
+        # --- dpa power lookup table (empty dict if not used by this model) ---
+        'dpa_power': result.dpa_power,
+        # --- model component inputs (all components with dvals, clipped to window) ---
+        'inputs': {name: _input_array(arr) for name, arr in result.inputs.items()},
     }
 
     encoded = json.dumps(payload, separators=(',', ':')).encode('utf-8')
@@ -659,7 +723,7 @@ def export_result(result, path):
         f.write(encoded)
 
 
-def run_all_models(tstart, tstop, outdir, models_root, limit_overrides=None, models=None):
+def run_all_models(tstart, tstop, outdir, models_root, limit_overrides=None, models=None, spec_overrides=None):
     """Evaluate models over a time range and write results to gzip JSON files.
 
     Iterates over MODELS (or a subset), runs evaluate(tstart, tstop), and writes
@@ -687,6 +751,10 @@ def run_all_models(tstart, tstop, outdir, models_root, limit_overrides=None, mod
         Any model can be overridden here; others use the spec default.
     models : list of str, optional
         Subset of MSIDs to evaluate.  Defaults to all 14 models in MODELS.
+    spec_overrides : dict, optional
+        MSID → absolute path to a spec JSON file.  When present for an MSID,
+        the supplied path is used instead of the default
+        ``{models_root}/{MODEL_SPECS[msid]}`` path.
 
     Returns
     -------
@@ -695,6 +763,8 @@ def run_all_models(tstart, tstop, outdir, models_root, limit_overrides=None, mod
     """
     if limit_overrides is None:
         limit_overrides = {}
+    if spec_overrides is None:
+        spec_overrides = {}
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -708,7 +778,7 @@ def run_all_models(tstart, tstop, outdir, models_root, limit_overrides=None, mod
     failed = {}
 
     for msid, cls in model_items:
-        spec_path = os.path.join(models_root, MODEL_SPECS[msid])
+        spec_path = spec_overrides.get(msid) or os.path.join(models_root, MODEL_SPECS[msid])
         out_path = os.path.join(outdir, f'{msid}.json.gz')
         try:
             logger.info('running %s (%s to %s)', msid, tstart, tstop)

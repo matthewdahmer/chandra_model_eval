@@ -101,30 +101,101 @@ def get_pitch_midpoints(model):
     return plist
 
 
-def get_solarheat_params(model):
-    """ Get Xija model solarheat values
-    Args:
-        model (xija.model.XijaModel): Xija model object
+def get_solarheat_components(model):
+    """Extract solarheat component parameters as a list of structured dicts.
 
-    Returns:
-        solar_params, p_names, dp_names
+    Returns one dict per SolarHeat component (excluding SolarHeatOffNomRoll).
+    Each dict groups P and dP pitch tables with the scalar parameters that govern
+    how they are combined at run time: tau, ampl, epoch, and bias/dh_heater.
+
+    For SolarHeat variants, P is a flat list aligned with P_pitches.
+    For SimZDepSolarHeat variants (all_simz_, psmc_, hrc_is_acis_simz_, etc.),
+    P is a dict keyed by instrument name (e.g. 'hrcs', 'hrci', 'aciss', 'acisi').
+    dP is always a flat list (one shared curve per component).
     """
-    solar_params = {}
+    components = []
 
-    r = re.compile('solarheat__([0-9a-zA-Z_]+__P[0-9a-zA-Z_]*)_.*')
-    names = [r.findall(d['full_name'])[0] for d in model.pars if r.findall(d['full_name'])]
-    p_names = list(set(names))
+    for comp in model.comp.values():
+        name = str(comp)
+        if 'solarheat' not in name or 'off_nom_roll' in name:
+            continue
 
-    r = re.compile('solarheat__([0-9a-zA-Z_]+__dP[0-9a-zA-Z_]*)_.*')
-    names = [r.findall(d['full_name'])[0] for d in model.pars if r.findall(d['full_name'])]
-    dp_names = list(set(names))
+        entry = {
+            'name': name,
+            'node': comp.node.name,
+            'class': type(comp).__name__,
+            'epoch': comp.epoch,
+            'tau': float(comp.tau),
+            'ampl': float(comp.ampl),
+            'P_pitches': comp.P_pitches.tolist(),
+            'dP_pitches': comp.dP_pitches.tolist(),
+        }
 
-    for core_name in p_names + dp_names:
-        r = re.compile(rf"solarheat__{core_name}_(\d+).*")
-        vals = [(r.findall(d['full_name'])[0], d['val']) for d in model.pars if r.findall(d['full_name'])]
-        solar_params[core_name] = vals
+        if hasattr(comp, 'instr_names'):
+            # SimZDepSolarHeat variant: one P curve per instrument, shared dP
+            entry['dh_heater'] = float(comp.dh_heater)
+            entry['P'] = {
+                instr: comp.parvals[i * comp.n_p:(i + 1) * comp.n_p].tolist()
+                for i, instr in enumerate(comp.instr_names)
+            }
+            entry['dP'] = comp.parvals[
+                comp.n_instr * comp.n_p:comp.n_instr * comp.n_p + comp.n_dp
+            ].tolist()
+        else:
+            # SolarHeat variant: single P curve
+            n_dp = len(comp.dP_pitches)
+            entry['bias'] = float(comp.bias)
+            entry['P'] = comp.parvals[:comp.n_pitches].tolist()
+            entry['dP'] = comp.parvals[comp.n_pitches:comp.n_pitches + n_dp].tolist()
+            for bias_par in ('hrc_bias', 'hrci_bias', 'hrcs_bias'):
+                if hasattr(comp, bias_par):
+                    entry[bias_par] = float(getattr(comp, bias_par))
 
-    return solar_params, p_names, dp_names
+        components.append(entry)
+
+    return components
+
+
+def get_dpa_power_params(model):
+    """Extract dpa_power component parameters from an xija model.
+
+    Returns a dict with:
+      'lookup' — pattern string (e.g. '0xxx', '1xx0') → power value (watts)
+      'mult'   — multiplicative scale factor applied to the looked-up power
+      'bias'   — constant offset added after scaling
+
+    The pattern strings encode which instrument-state dimensions are relevant
+    for each entry; 'x' is a wildcard. Position order is fep_count, ccd_count,
+    vid_board, clocking (vid_board is always wildcarded in current models).
+
+    Returns an empty dict if the model contains no dpa_power lookup parameters.
+    """
+    lookup = {}
+    mult = None
+    bias = None
+
+    prefix = 'dpa_power__'
+    for par in model.pars:
+        full_name = par['full_name']
+        if not full_name.startswith(prefix):
+            continue
+        param_name = full_name[len(prefix):]
+        if param_name.startswith('pow_'):
+            lookup[param_name[4:]] = float(par['val'])
+        elif param_name == 'mult':
+            mult = float(par['val'])
+        elif param_name == 'bias':
+            bias = float(par['val'])
+
+    if not lookup:
+        return {}
+
+    result = {'lookup': lookup}
+    if mult is not None:
+        result['mult'] = mult
+    if bias is not None:
+        result['bias'] = bias
+    return result
 
 
 def _cxc_to_dt(cxc_secs):
@@ -216,46 +287,48 @@ def compute_pitch_bin_statistics(telem_segments, err_segments):
     return result
 
 
-def build_dwell_table(metadata, telem_segments, err_segments, segment_norm, telem_bounds):
+def build_dwell_table(metadata, telem_segments, err_segments, segment_norm, telem_bounds,
+                      dist_sat_earth=None, extra_msid_data=None):
     """Build a per-dwell analytics table from pitch-binned segment data.
 
     Each dwell that passed the >1 hr filter in bin_data_by_pitch contributes one row.
     Dwells are sorted chronologically by tstart.
 
     Args:
-        metadata        : dict[bin_idx → numpy structured array] from bin_data_by_pitch
-        telem_segments  : dict[bin_idx → list of [(relt_s, temp), ...]]
-        err_segments    : dict[bin_idx → list of [(relt_s, err), ...]]
-        segment_norm    : dict[bin_idx → list of floats] (normalised starting temp)
-        telem_bounds    : (t_min, t_max) tuple
+        metadata          : dict[bin_idx → numpy structured array] from bin_data_by_pitch
+        telem_segments    : dict[bin_idx → list of [(relt_s, temp), ...]]
+        err_segments      : dict[bin_idx → list of [(relt_s, err), ...]]
+        segment_norm      : dict[bin_idx → list of floats] (normalised starting temp)
+        telem_bounds      : (t_min, t_max) tuple
+        dist_sat_earth    : optional (times_array, vals_array) from cheta for dist_sat_earth
+        extra_msid_data   : optional dict of {msid_name: (times_array, vals_array)} for
+                            per-dwell median values of additional MSIDs
 
     Returns:
-        dict of parallel lists, one entry per dwell:
-            tstart          CXC seconds
-            datestart       Chandra date string (YYYY:DDD:HH:MM:SS.sss)
-            pitch           mean pitch angle for the dwell (degrees)
-            simpos          SIM-Z position
-            obs_start_temp  observed temperature at dwell start
-            obs_max_temp    maximum observed temperature during dwell
-            obs_mean_temp   mean observed temperature during dwell
-            err_mean        mean residual (observed − predicted) over dwell
-            err_max_abs     largest absolute residual over dwell
-            err_p95         95th percentile of |residual| over dwell
-            err_end         mean error in the last 20% of the dwell (drift indicator)
-            n_points        number of finite time steps
-            pitch_bin       pitch bin index (int)
+        dict of parallel lists, one entry per dwell.
     """
     from cxotime import CxoTime
 
     t_min, t_max = telem_bounds
     t_range = t_max - t_min
 
-    rows = {k: [] for k in [
-        'tstart', 'pitch', 'simpos',
+    base_keys = [
+        'tstart', 'pitch', 'simpos', 'fep_count', 'ccd_count', 'clocking', 'off_nom_roll',
         'obs_start_temp', 'obs_max_temp', 'obs_mean_temp',
         'err_mean', 'err_max_abs', 'err_p95', 'err_end',
         'n_points', 'pitch_bin',
-    ]}
+    ]
+    if dist_sat_earth is not None:
+        base_keys.append('dist_satearth')
+    if extra_msid_data:
+        base_keys.extend(sorted(extra_msid_data.keys()))
+
+    rows = {k: [] for k in base_keys}
+
+    # Pre-unpack dist_sat_earth arrays for fast lookup
+    dse_times = dse_vals = None
+    if dist_sat_earth is not None:
+        dse_times, dse_vals = dist_sat_earth
 
     for bin_idx in sorted(metadata.keys(), key=lambda k: int(k)):
         dwells = metadata[bin_idx]
@@ -291,9 +364,16 @@ def build_dwell_table(metadata, telem_segments, err_segments, segment_norm, tele
             obs_start = float(t_min + norm_val * t_range)
 
             dwell = dwells[i]
-            rows['tstart'].append(float(dwell['tstart']))
+            tstart = float(dwell['tstart'])
+            tstop = float(dwell['tstop'])
+
+            rows['tstart'].append(tstart)
             rows['pitch'].append(float(dwell['pitch']))
             rows['simpos'].append(int(dwell['simpos']))
+            rows['fep_count'].append(int(dwell['fep_count']))
+            rows['ccd_count'].append(int(dwell['ccd_count']))
+            rows['clocking'].append(int(dwell['clocking']))
+            rows['off_nom_roll'].append(float(dwell['off_nom_roll']))
             rows['obs_start_temp'].append(obs_start)
             rows['obs_max_temp'].append(float(np.max(tel_f)))
             rows['obs_mean_temp'].append(float(np.mean(tel_f)))
@@ -304,6 +384,27 @@ def build_dwell_table(metadata, telem_segments, err_segments, segment_norm, tele
             rows['n_points'].append(n)
             rows['pitch_bin'].append(int(bin_idx))
 
+            # dist_sat_earth at dwell start: nearest sample at or before tstart
+            if dse_times is not None and len(dse_times) > 0:
+                idx = np.searchsorted(dse_times, tstart, side='right') - 1
+                idx = max(0, min(idx, len(dse_vals) - 1))
+                rows['dist_satearth'].append(float(dse_vals[idx]))
+
+            # Extra MSIDs: median (numeric) or mode (string/categorical) over dwell
+            if extra_msid_data:
+                for msid_name, (mt, mv) in extra_msid_data.items():
+                    mask = (mt >= tstart) & (mt <= tstop)
+                    vals_in_dwell = mv[mask]
+                    if len(vals_in_dwell) == 0:
+                        rows[msid_name].append(None)
+                    elif np.issubdtype(vals_in_dwell.dtype, np.number):
+                        finite = vals_in_dwell[np.isfinite(vals_in_dwell)]
+                        rows[msid_name].append(float(np.median(finite)) if len(finite) > 0 else None)
+                    else:
+                        from collections import Counter
+                        c = Counter(vals_in_dwell.tolist())
+                        rows[msid_name].append(c.most_common(1)[0][0] if c else None)
+
     if not rows['tstart']:
         rows['datestart'] = []
         return rows
@@ -311,7 +412,7 @@ def build_dwell_table(metadata, telem_segments, err_segments, segment_norm, tele
     # Sort by time
     order = np.argsort(rows['tstart'])
     for k in rows:
-        rows[k] = np.array(rows[k])[order].tolist()
+        rows[k] = np.array(rows[k], dtype=object)[order].tolist()
 
     rows['datestart'] = CxoTime(np.array(rows['tstart'])).date.tolist()
 

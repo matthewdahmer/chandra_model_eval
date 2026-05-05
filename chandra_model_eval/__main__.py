@@ -41,6 +41,8 @@ def main():
             '  chandra-model-eval --trailing-days 365 /data/out ~/AXAFLIB/chandra_models\n'
             '      --limit-override pm2thv1t=227.5\n'
             '  chandra-model-eval --trailing-days 30 /data/out ~/AXAFLIB/chandra_models\n'
+            '      --model 1dpamzt\n'
+            '  chandra-model-eval --trailing-days 30 /data/out ~/AXAFLIB/chandra_models\n'
             '      --models 1dpamzt aacccdpt --log-file /data/out/run.log'
         ),
     )
@@ -81,6 +83,22 @@ def main():
         ),
     )
     parser.add_argument(
+        '--model', metavar='MSID',
+        choices=sorted(MODELS),
+        help=(
+            'Run a single model by MSID. '
+            f'Choices: {", ".join(sorted(MODELS))}'
+        ),
+    )
+    parser.add_argument(
+        '--spec', metavar='PATH',
+        help=(
+            'Path to a model spec JSON file. '
+            'Overrides the default spec for the model given by --model. '
+            'Only valid with --model.'
+        ),
+    )
+    parser.add_argument(
         '--models', metavar='MSID', nargs='+',
         choices=sorted(MODELS),
         help=(
@@ -99,6 +117,18 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # --- Resolve model selection ---
+    if args.model and args.models:
+        parser.error('--model and --models are mutually exclusive')
+    if args.spec and not args.model:
+        parser.error('--spec requires --model')
+    if args.model:
+        models_to_run = [args.model]
+    else:
+        models_to_run = args.models  # None means all 14
+
+    spec_overrides = {args.model: args.spec} if args.spec else {}
 
     # --- Resolve time range ---
     if args.trailing_days is not None:
@@ -137,7 +167,8 @@ def main():
         outdir=args.outdir,
         models_root=args.models_root,
         limit_overrides=limit_overrides,
-        models=args.models,
+        models=models_to_run,
+        spec_overrides=spec_overrides,
     )
 
     n_ok = len(result['succeeded'])

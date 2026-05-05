@@ -20,3 +20,6 @@ chandra-model-eval = "chandra_model_eval.__main__:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["chandra_model_eval*"]
+
+[tool.chandra_model_eval]
+conda_env = "ska3-dev"
