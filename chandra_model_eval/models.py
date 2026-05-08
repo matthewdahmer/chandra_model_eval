@@ -245,21 +245,27 @@ class ChandraModel:
         Falls back to empty structures and logs a warning on any failure.
         """
         _empty = ({}, {}, {}, {}, {}, {}, {})
+        step = 'import cheta'
         try:
             from cheta import fetch_eng
+            step = 'get_pitch_midpoints'
             plist = get_pitch_midpoints(model)
             if not plist:
                 telem_bounds = (float(np.nanmin(dvals)), float(np.nanmax(dvals)))
                 return [], *_empty, telem_bounds
+            step = 'get_npnt_state_data'
             state_data = get_npnt_state_data(tstart, tstop)
+            step = 'bin_data_by_pitch'
             error = dvals - mvals
             metadata, telem_segments, err_segments, segment_norm, telem_bounds = \
                 bin_data_by_pitch(state_data, plist, times, dvals, error)
+            step = 'compute_pitch_bin_statistics'
             pitch_bin_statistics = compute_pitch_bin_statistics(telem_segments, err_segments)
 
-            # Fetch dist_sat_earth for the evaluation window
+            # Fetch dist_satearth for the evaluation window
             dist_sat_earth = None
             try:
+                step = 'fetch dist_satearth'
                 dse = fetch_eng.MSID('dist_satearth', tstart, tstop, filter_bad=True)
                 if len(dse.times) > 0:
                     dist_sat_earth = (dse.times, dse.vals)
@@ -272,6 +278,7 @@ class ChandraModel:
                 extra_msid_data = {}
                 for msid_name in self.extra_dwell_msids:
                     try:
+                        step = f'fetch extra MSID {msid_name}'
                         dat = fetch_eng.MSID(msid_name, tstart, tstop, filter_bad=True)
                         if len(dat.times) > 0:
                             vals = dat.raw_vals.copy()
@@ -282,18 +289,24 @@ class ChandraModel:
                         logger.warning('extra MSID fetch failed for %s/%s: %s',
                                        self.msid, msid_name, exc)
 
+            step = 'build_dwell_table'
             dwell_table = build_dwell_table(
                 metadata, telem_segments, err_segments, segment_norm, telem_bounds,
                 dist_sat_earth=dist_sat_earth,
                 extra_msid_data=extra_msid_data,
             )
+            step = 'compute_analytics'
             analytics = compute_analytics(
                 dwell_table, telem_bounds, self.limit, self.limit_type
             )
             return (plist, metadata, telem_segments, err_segments, segment_norm, telem_bounds,
                     pitch_bin_statistics, dwell_table, analytics)
         except Exception as exc:
-            logger.warning('pitch data computation failed for %s: %s', self.msid, exc)
+            import traceback
+            logger.warning(
+                'pipeline step "%s" failed for %s: %s\n%s',
+                step, self.msid, exc, traceback.format_exc(),
+            )
             telem_bounds = (float(np.nanmin(dvals)), float(np.nanmax(dvals)))
             return [], *_empty, telem_bounds
 
