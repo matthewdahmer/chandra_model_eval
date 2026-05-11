@@ -1,5 +1,6 @@
 import re
 from datetime import datetime, timezone
+import errno
 
 import numpy as np
 import xija
@@ -16,17 +17,9 @@ def get_npnt_state_data(tstart, tstop):
         (numpy.ndarray): state data
     """
 
-    keys = ['pitch', 'off_nom_roll', 'ccd_count', 'fep_count', 'clocking', 'vid_board', 'pcad_mode', 'simpos', 'off_nom_roll']
-
-    try:
-        state_data = states.get_states(tstart, tstop, state_keys=keys, merge_identical=True)
-    except OSError as e:
-        import errno
-        if e.errno == errno.ENETUNREACH:
-            state_data = states.get_states(tstart, tstop, state_keys=keys, merge_identical=True, scenario="flight")
-        else:
-            raise
-
+    keys = ['pitch', 'off_nom_roll', 'ccd_count', 'fep_count', 'clocking', 'vid_board', 'pcad_mode', 'simpos']
+    state_data = states.get_states(tstart, tstop, state_keys=keys, merge_identical=True)
+    
     # relying on 'pcad_mode' to ensure attitude does not change significantly within a dwell
     state_data = states.reduce_states(state_data, ['pcad_mode'], all_keys=True, merge_identical=True)
 
