@@ -73,7 +73,7 @@
 │   ├── ccd_count     [int]          Number of CCDs active (from kadi state)
 │   ├── clocking      [int]          ACIS clocking flag 0/1 (from kadi state)
 │   ├── off_nom_roll  [float]        Off-nominal roll angle (degrees, from kadi state)
-│   ├── dist_satearth [float|null]  Earth–spacecraft distance (km) at dwell start (cheta)
+│   ├── dist_satearth [float]        Earth–spacecraft distance (m) at dwell start (cheta); key absent if fetch failed
 │   ├── obs_start_temp [float]       Observed temperature at dwell start
 │   ├── obs_max_temp  [float]        Peak observed temperature during dwell
 │   ├── obs_mean_temp [float]        Mean observed temperature during dwell
@@ -84,7 +84,7 @@
 │   ├── n_points      [int]          Finite time steps in dwell
 │   ├── pitch_bin     [int]          Pitch bin index
 │   │
-│   │   (2ceahvpt only — median raw_vals over dwell duration from cheta)
+│   │   (2ceahvpt only — median raw_vals over dwell duration from cheta; a key is absent if its fetch failed)
 │   ├── 2imonst       [float|null]   HRC-I monitor on/off (raw: 0=OFF, 1=ON)
 │   ├── 2sponst       [float|null]   HRC-S outer shield on/off (raw: 0=OFF, 1=ON)
 │   ├── 2s2onst       [float|null]   HRC-S inner shield on/off (raw: 0=OFF, 1=ON)
@@ -92,7 +92,7 @@
 │   ├── 215pcast      [float|null]   +15V power supply on/off (raw inverted: 0=ON, 1=OFF)
 │   └── aoeclips      [float|null]   Earth limb clip on/off (raw: 0=no clip, 1=clipping)
 │
-├── analytics         dict   Pre-computed diagnostics
+├── analytics         dict   Pre-computed diagnostics ({} if no qualifying dwells)
 │   ├── near_limit_threshold  float  Temperature above/below which a dwell is "near-limit"
 │   │                                (top third of observed range for max-limit models;
 │   │                                 bottom third for min-limit models)
@@ -135,13 +135,16 @@
 │   ├── dP_pitches  [float]  Pitch grid for dP values (may differ from P_pitches)
 │   └── dP          [float]  Degradation heating increment aligned with dP_pitches
 │
-└── dpa_power       dict   DPA power lookup table; empty dict if model has no dpa_power parameters
-    ├── lookup      dict   Pattern string → power value (watts)
-    │               Keys encode instrument state: position order is fep_count, ccd_count,
-    │               vid_board, clocking; 'x' means wildcard (e.g. "1xx0" = fep=1, clk=0,
-    │               any ccd/vid_board). The most specific matching entry is used at run time.
-    ├── mult        float  Scale factor applied to the looked-up power value
-    └── bias        float  Constant offset added after scaling
+├── dpa_power       dict   DPA power lookup table; empty dict if model has no dpa_power parameters
+│   ├── lookup      dict   Pattern string → power value (watts)
+│   │               Keys encode instrument state: position order is fep_count, ccd_count,
+│   │               vid_board, clocking; 'x' means wildcard (e.g. "1xx0" = fep=1, clk=0,
+│   │               any ccd/vid_board). The most specific matching entry is used at run time.
+│   ├── mult        float  Scale factor (percent): power = mult/100 * (lookup - bias)
+│   └── bias        float  Offset subtracted from the looked-up value before scaling
+│
+└── inputs          dict   Component name → [float|int|null] dvals array aligned to times
+                           (every xija component whose dvals length matches; bools as 0/1)
 ```
 
 ---
@@ -215,7 +218,7 @@ All pitch-binned data is derived by splitting the evaluation period into NPNT dw
 
 **`plist`** — Pitch bin boundary values in degrees, derived from the solarheat pitch grid in the model spec. There are N+1 boundaries for N bins. A dwell with pitch p falls in bin i where `plist[i] ≤ p < plist[i+1]`.
 
-**`telem_bounds`** — `[global_min, global_max]` of observed temperature across the entire evaluation window. Used as the normalisation range for `segment_norm` and as the domain for `error_by_temperature` bins in `analytics`.
+**`telem_bounds`** — `[global_min, global_max]` of observed temperature across the entire evaluation window. Used as the normalisation range for `segment_norm` and as the domain for `error_by_temperature` bins in `analytics`. It is populated even when the rest of the pitch pipeline fails (e.g. kadi unavailable). Files written before the fallback fix may instead have `[]` here and the `[min, max]` pair as the value of `analytics`.
 
 **`metadata`** — Per-bin array of kadi state records, one per dwell. Each record carries the full NPNT state: `tstart`, `tstop`, `pitch`, `off_nom_roll`, `simpos`, `ccd_count`, `fep_count`, `clocking`, `vid_board`, `pcad_mode`, `trans_keys`. The index into this array matches the index into `telem_segments` and `err_segments` for the same bin.
 
@@ -253,7 +256,7 @@ A compact row-per-dwell table stored as parallel arrays, sorted chronologically.
 - **`ccd_count`** — Number of ACIS CCDs active during the dwell, from kadi commanded state.
 - **`clocking`** — ACIS clocking state (0 = idle, 1 = clocking) from kadi. A clocking ACIS draws more power, affecting DPA-heated nodes.
 - **`off_nom_roll`** — Off-nominal roll angle in degrees at dwell start, from kadi. Non-zero roll changes solar illumination geometry and can affect heating for models with roll-dependent solarheat components.
-- **`dist_satearth`** — Earth–spacecraft distance in km at the start of the dwell, fetched from the cheta engineering archive (`dist_satearth` MSID). `null` if the archive fetch failed or returned no data for the time range.
+- **`dist_satearth`** — Earth–spacecraft distance in **metres** at the start of the dwell (the nearest sample at or before `tstart`), fetched from the cheta engineering archive (`dist_satearth` MSID). Typical values are ~1e7–1.5e8. If the archive fetch failed or returned no data for the window, the whole key is absent from `dwell_table`; it is never filled with `null`.
 - **`obs_start_temp`** — Observed temperature at the very start of the dwell. Useful for studying how the starting condition affects subsequent model error.
 - **`obs_max_temp`** — Peak observed temperature during the dwell. The key quantity for max-limit risk assessment in individual dwells.
 - **`obs_mean_temp`** — Mean observed temperature during the dwell. Used throughout `analytics` as the representative temperature for this dwell (e.g. for `error_by_temperature` binning and `near_limit_threshold` classification).
@@ -264,7 +267,7 @@ A compact row-per-dwell table stored as parallel arrays, sorted chronologically.
 - **`n_points`** — Number of finite time steps in the dwell. Proportional to dwell duration (~328 s cadence). Used as the weight in `analytics.monthly`.
 - **`pitch_bin`** — Integer index into `plist` for this dwell's pitch bin. Links `dwell_table` rows back to the corresponding `pitch_analysis` entries.
 
-**HRC-specific columns** (`2ceahvpt` model only) — values are derived from `.raw_vals` (integer encoding) in cheta, then the median is taken over the dwell interval. `null` if the archive fetch failed or the dwell has no valid samples.
+**HRC-specific columns** (`2ceahvpt` model only) — values are derived from `.raw_vals` (integer encoding) in cheta, then the median is taken over the dwell interval (`tstart ≤ t ≤ tstop`). A median can be `0.5` if the state changed mid-dwell. A column is absent entirely if its archive fetch failed; `null` appears only for individual dwells with no samples.
 
 - **`2imonst`** — HRC-I monitor status. `raw_vals` encoding: 0 = OFF, 1 = ON.
 - **`2sponst`** — HRC-S outer anti-coincidence shield status. Same 0/1 encoding.
@@ -277,7 +280,7 @@ A compact row-per-dwell table stored as parallel arrays, sorted chronologically.
 
 ### `analytics`
 
-Pre-computed diagnostics derived entirely from `dwell_table`. Designed to give a complete picture of model accuracy without requiring further computation. All `mean` values are means of `err_mean` (per-dwell bias), not of the raw time-series residuals.
+Pre-computed diagnostics derived entirely from `dwell_table`. Designed to give a complete picture of model accuracy without requiring further computation. All `mean` values are means of `err_mean` (per-dwell bias), not of the raw time-series residuals. `analytics` is `{}` when there are no qualifying dwells. `period_comparison.split_date` is `null` when there is only one dwell.
 
 **`near_limit_threshold`** — A single temperature value that divides dwells into "routine" vs "near-limit." Computed from the observed temperature range over the evaluation window, not from the limit value itself:
 
@@ -311,7 +314,9 @@ What to look for: if `recent.mean` is larger in magnitude than `early.mean`, the
 heat(pitch, t) = P(pitch) + dP(pitch) * (t_days / tau) + ampl * cos(t_phase) + bias
 ```
 
-where `t_days = (t - epoch) / 86400` and `dP(pitch) / tau` is the heating rate slope in units/day. P and dP are linearly interpolated onto the requested pitch from their respective pitch grids. Degradation is linear; the exponential var_func option in xija is no longer used.
+where `t_days = (t - epoch) / 86400` and `dP(pitch) / tau` is the heating rate slope in units/day. P and dP are linearly interpolated onto the requested pitch from their respective pitch grids.
+
+This linear form holds for every solarheat component in the current `chandra_models` specs. Plain `SolarHeat`-family components set `var_func: "linear"` explicitly, and the `SimZDepSolarHeat` variants default to `linear`. xija's own default for `SolarHeat` is `exp`, i.e. `dP * (1 - exp(-t_days / tau))`. `var_func` is **not** exported, so a future spec that omits it on a plain `SolarHeat` component would not follow the formula above.
 
 **Fields present in every component:**
 
@@ -337,9 +342,9 @@ where `t_days = (t - epoch) / 86400` and `dP(pitch) / tau` is the heating rate s
 
 ### DPA power parameters
 
-**`dpa_power`** — DPA power lookup table extracted from the xija model. Present in models that predict DPA-heated nodes (`1dpamzt`, `1deamzt`, `1pdeaat`); empty dict `{}` for all other models.
+**`dpa_power`** — DPA power lookup table extracted from the xija `AcisDpaStatePower` component. Non-empty for every model whose spec has one: `1dpamzt`, `1deamzt`, `1pdeaat`, `fptemp` and `2ceahvpt`. It is an empty dict `{}` for all other models.
 
-The computed power at any moment is `lookup[best_match] * mult + bias`, where `best_match` is the most specific entry in `lookup` that matches the current instrument state.
+The computed power at any moment is `mult / 100 * (lookup[best_match] - bias)`, where `best_match` is the most specific entry in `lookup` that matches the current commanded instrument state (from kadi).
 
 **`lookup`** — Dict mapping pattern strings to power values in watts. Each key is a 4-character string encoding the instrument state in order: `fep_count`, `ccd_count`, `vid_board`, `clocking`. The character `x` is a wildcard meaning "match any value for this dimension." For example:
 
@@ -352,6 +357,20 @@ The computed power at any moment is `lookup[best_match] * mult + bias`, where `b
 
 At run time, xija selects the most specific matching entry (fewest wildcards) for the current state. The set of keys varies by model — some models parameterise by fep_count and clocking only, others include ccd_count.
 
-**`mult`** — Multiplicative scale factor applied to the looked-up power value.
+**`mult`** — Scale factor in percent: the power is multiplied by `mult / 100`.
 
-**`bias`** — Constant offset (watts) added after scaling.
+**`bias`** — Constant offset (watts) subtracted from the looked-up value *before* scaling.
+
+---
+
+### `inputs`
+
+**`inputs`** — Object mapping each xija component name to that component's `dvals` array. Arrays have the same length and time axis as `times`, clipped to the requested window. Contents by component type:
+
+- **Real telemetry MSIDs** (e.g. `pitch`, `sim_z`, `roll`, `eclipse`): data fetched from cheta or kadi.
+- **Pseudo-nodes set in `model_init`** (e.g. `dpa0`, `aca0`): constant arrays at the initial value.
+- **Heat components** (e.g. `solarheat__dpa0`): computed power arrays.
+
+For `dpa_power`, `dvals` is diagnostic only. It is normally the telemetered `dp_dpa_power`, but it is all zeros for models that set `dpa_power: 0.0` in `model_init` (`1dpamzt`, `1deamzt`, `1pdeaat`, `2ceahvpt`). The heat actually applied comes from the lookup table above.
+
+Float arrays use `null` for NaN/inf; bool arrays are written as 0/1; integer arrays are written as-is. Components whose `dvals` cannot be read, or whose length differs from `model.times`, are silently omitted.

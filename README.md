@@ -6,9 +6,11 @@ Xija thermal model wrappers for Chandra mission planning and evaluation. Provide
 
 - `xija` — Chandra thermal modeling framework
 - `numpy`
-- `cxotime` — Chandra time conversion (used in `export_result`)
-- `cheta` — engineering telemetry archive (required by `evaluate()` to fetch observed data)
-- `kadi` — commanded states archive (used internally by xija for some models)
+- `cxotime` — Chandra time conversion (used in `evaluate()`, the dwell/analytics code and `export_result`)
+- `cheta` — engineering telemetry archive (required by `evaluate()` to fetch observed data, `dist_satearth` and model-specific per-dwell MSIDs)
+- `kadi` — commanded states archive. Imported at module load by `calc_model_data.py` (so it is required to import the package) and used to find NPNT dwells; also used inside xija by `AcisDpaStatePower` components
+
+None of these except `numpy` are on PyPI; they come from a Ska conda environment. The environment name is stored in `pyproject.toml` under `[tool.chandra_model_eval].conda_env`.
 
 ## Installation
 
@@ -132,7 +134,7 @@ m.all_limits
 # }
 ```
 
-> **Note:** `ModelPM2THV1T` (`pm2thv1t`) has no limits defined in its model spec. An explicit `limit` value must always be passed for this model.
+> **Note:** every current spec defines a planning limit, so `limit` is optional for all 14 models. If a spec has no limit for its MSID, construction raises `ValueError` and `limit` must be passed.
 
 ## Two operating modes
 
@@ -178,6 +180,14 @@ Internally the model is run starting 7 days before `tstart` so that errors from 
 | `spec_md5` | str | MD5 hex digest of the model spec file on disk |
 | `spec_github_url` | str or None | Permanent GitHub blob URL using the commit SHA; `None` if git is unavailable |
 | `spec_github_release` | str or None | Exact git tag if on a release, otherwise `git describe --tags` output; `None` if no tags reachable |
+| `plist`, `metadata`, `telem_segments`, `err_segments`, `segment_norm`, `telem_bounds`, `pitch_bin_statistics` | various | Pitch-binned dwell data; exported under `pitch_analysis` (see below) |
+| `dwell_table` | dict | Per-dwell table of parallel lists |
+| `analytics` | dict | Pre-computed diagnostics derived from `dwell_table` |
+| `solar_heat_components` | list | One dict of solarheat parameters per solarheat component |
+| `dpa_power` | dict | DPA power lookup table; `{}` if the model has no `dpa_power` component |
+| `inputs` | dict | Component name → `dvals` array for every xija component, aligned to `times` |
+
+The pitch/dwell/analytics fields are empty if the pitch pipeline fails (e.g. kadi unavailable); the time-series fields are still valid. `telem_bounds` is still populated in that case.
 
 ### `.residuals`
 
@@ -366,10 +376,18 @@ A compact table of one row per qualifying dwell (>1 hr NPNT), sorted chronologic
 | `err_end` | array of numbers | Mean error in the last 20% of the dwell — intra-dwell drift indicator |
 | `n_points` | array of integers | Number of finite time steps in the dwell |
 | `pitch_bin` | array of integers | Which `plist` bin this dwell falls in |
+| `fep_count`, `ccd_count`, `clocking` | arrays of integers | ACIS configuration from the kadi state |
+| `off_nom_roll` | array of numbers | Off-nominal roll angle (degrees) from the kadi state |
+| `dist_satearth` | array of numbers | Earth–spacecraft distance in **metres** at dwell start (cheta). Column is absent if the fetch failed |
+| `2imonst`, `2sponst`, `2s2onst`, `224pcast`, `215pcast`, `aoeclips` | arrays of numbers/null | `2ceahvpt` only: per-dwell median of cheta `raw_vals` (0/1; `224pcast`/`215pcast` inverted). A column is absent if its fetch failed; `null` for dwells with no samples |
+
+See `file_structure.md` for the exact encoding of each column.
 
 ### `analytics` — high-level performance metrics
 
 Pre-computed analytics derived from `dwell_table`. Designed to give a complete picture of model accuracy trends without requiring further computation, particularly for understanding behaviour near the planning limit.
+
+`analytics` is `{}` when there are no qualifying dwells.
 
 **`near_limit_threshold`** (number): The observed-temperature threshold used to define "near-limit" dwells throughout this section. For `limit_type = "max"` models it is the top third of `telem_bounds` (dwells where `obs_mean_temp ≥ threshold` are near-limit). For `limit_type = "min"` models it is the bottom third (dwells where `obs_mean_temp ≤ threshold`). Near-limit dwells are where model errors matter most for mission planning.
 
@@ -401,13 +419,17 @@ Pre-computed analytics derived from `dwell_table`. Designed to give a complete p
 | `all.early` / `all.recent` | `{n, mean, std, p95_abs}` for all dwells in each period |
 | `near_limit.early` / `near_limit.recent` | Same, restricted to near-limit dwells |
 
-### Solarheat parameters
+### `solar_heat_components` — solarheat parameters
 
-| Key | Type | Description |
-|---|---|---|
-| `solar_params` | object | Parameter group name → array of `[pitch_string, value]` pairs. Covers both direct (`P`) and differential (`dP`) solarheat heating parameters from the model spec. |
-| `p_names` | array of strings | Names of the direct solarheat parameter groups (e.g. `"cea0__P_hrcs"`). |
-| `dp_names` | array of strings | Names of the differential solarheat parameter groups (e.g. `"cea0__dP"`). |
+An array with one object per solarheat component in the model (`SolarHeatOffNomRoll` components are excluded). Each object has `name`, `node`, `class`, `epoch`, `tau`, `ampl`, `P_pitches`, `P`, `dP_pitches` and `dP`, plus the variant-specific keys `bias`, `dh_heater`, `hrc_bias`, `hrci_bias` and `hrcs_bias` where they apply. For `SimZDepSolarHeat` variants, `P` is a dict keyed by instrument (`hrcs`, `hrci`, `aciss`, `acisi`); otherwise it is a flat list aligned with `P_pitches`. See `file_structure.md` for the full field reference.
+
+### `dpa_power` — DPA power lookup table
+
+`{}` for models without an `AcisDpaStatePower` `dpa_power` component. Otherwise it is `{"lookup": {pattern: watts, ...}, "mult": float, "bias": float}`. Each 4-character pattern encodes `fep_count`, `ccd_count`, `vid_board` and `clocking`, with `x` as a wildcard. The applied power is `mult/100 * (lookup[state] - bias)`. Present for `1dpamzt`, `1deamzt`, `1pdeaat`, `fptemp` and `2ceahvpt`.
+
+### `inputs` — model component data
+
+An object mapping every xija component name to its `dvals` array, aligned to `times` and clipped to the requested window. It contains fetched telemetry for real MSIDs (e.g. `pitch`, `sim_z`), set values for pseudo-nodes, and computed arrays for heat components. Float arrays use `null` for NaN, bool arrays are written as 0/1, and integer arrays are written as-is. Components whose `dvals` cannot be read, or whose length does not match `times`, are omitted.
 
 ## Running all models — `run_all_models`
 
@@ -421,7 +443,6 @@ report = run_all_models(
     tstop='2025:090',
     outdir='/data/model_eval/results',
     models_root='/proj/sot/ska/data/chandra_models',
-    limit_overrides={'pm2thv1t': 227.5},
 )
 # report == {'succeeded': ['aacccdpt', '1deamzt', ...], 'failed': {}}
 ```
@@ -432,8 +453,9 @@ report = run_all_models(
 | `tstop` | str | Stop time |
 | `outdir` | str | Output directory; created if it does not exist |
 | `models_root` | str | Root of the `chandra_models` repo checkout |
-| `limit_overrides` | dict or None | MSID → explicit limit; required for `pm2thv1t`, optional for any other model |
+| `limit_overrides` | dict or None | MSID → explicit limit, replacing the spec value; optional for any model |
 | `models` | list or None | Subset of MSIDs to evaluate; defaults to all 14 |
+| `spec_overrides` | dict or None | MSID → absolute spec path, used instead of `{models_root}/{MODEL_SPECS[msid]}` |
 
 Output files are named `{msid}.json.gz` and written to `outdir`. Each run overwrites the previous file.
 
@@ -468,22 +490,26 @@ chandra-model-eval 2025:001 2026:001 /data/model_eval ~/AXAFLIB/chandra_models
 
 # Rolling 365-day window ending at UTC now (typical cron usage)
 chandra-model-eval --trailing-days 365 /data/model_eval ~/AXAFLIB/chandra_models \
-    --limit-override pm2thv1t=227.5 \
     --log-file /data/model_eval/run.log
 
 # Rolling window with an explicit end date (useful when data lags current time)
 chandra-model-eval --trailing-days 365 --end-date 2025:180 \
-    /data/model_eval ~/AXAFLIB/chandra_models \
-    --limit-override pm2thv1t=227.5
+    /data/model_eval ~/AXAFLIB/chandra_models
+
+# Override one model's limit instead of using the spec value
+chandra-model-eval --trailing-days 365 /data/model_eval ~/AXAFLIB/chandra_models \
+    --limit-override 1dpamzt=37.5
 ```
 
 **Options:**
 
 | Flag | Description |
 |---|---|
-| `--trailing-days N` | Rolling window of N days; window ends at UTC now (or `--end-date` if given) |
-| `--end-date DATE` | End of the `--trailing-days` window (e.g. `2025:180`); defaults to UTC now |
-| `--limit-override MSID=VALUE` | Override the planning limit for one model; repeatable; required for `pm2thv1t` |
+| `--trailing-days N` | Rolling window of N days; window ends at UTC now (or `--end-date` if given). Both ends are truncated to whole days (00:00 UTC) |
+| `--end-date DATE` | End of the `--trailing-days` window (e.g. `2025:180`); defaults to UTC now. Only valid with `--trailing-days` |
+| `--limit-override MSID=VALUE` | Override the spec's planning limit for one model; repeatable; optional |
+| `--model MSID` | Run a single model (mutually exclusive with `--models`) |
+| `--spec PATH` | Custom spec JSON for the model given by `--model`; only valid with `--model`. Useful for testing a candidate spec |
 | `--models MSID ...` | Run only the listed models (default: all 14) |
 | `--log-level LEVEL` | `DEBUG`, `INFO` (default), `WARNING`, or `ERROR` |
 | `--log-file PATH` | Write log output to a file instead of stderr |
@@ -507,8 +533,7 @@ MODELS_ROOT = '/proj/sot/ska/data/chandra_models'
 
 for msid, cls in MODELS.items():
     spec = f'{MODELS_ROOT}/{MODEL_SPECS[msid]}'
-    limit = 210.0 if msid == 'pm2thv1t' else None   # pm2thv1t has no spec default
-    m = cls(model_spec=spec, limit=limit)
+    m = cls(model_spec=spec)   # pass limit=... to override the spec value
     result = m.evaluate('2025:001', '2025:090')
 ```
 

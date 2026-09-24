@@ -39,7 +39,7 @@ def main():
             'Examples:\n'
             '  chandra-model-eval 2025:001 2026:001 /data/out ~/AXAFLIB/chandra_models\n'
             '  chandra-model-eval --trailing-days 365 /data/out ~/AXAFLIB/chandra_models\n'
-            '      --limit-override pm2thv1t=227.5\n'
+            '      --limit-override 1dpamzt=37.5\n'
             '  chandra-model-eval --trailing-days 30 /data/out ~/AXAFLIB/chandra_models\n'
             '      --model 1dpamzt\n'
             '  chandra-model-eval --trailing-days 30 /data/out ~/AXAFLIB/chandra_models\n'
@@ -77,8 +77,8 @@ def main():
         type=_parse_limit_override, default=[],
         dest='limit_overrides',
         help=(
-            'Override the planning limit for a model (e.g. pm2thv1t=227.5). '
-            'Required for pm2thv1t, which has no limit in its spec. '
+            'Override the spec planning limit for a model (e.g. 1dpamzt=37.5). '
+            'Optional; needed only for a spec with no planning limit. '
             'May be repeated.'
         ),
     )

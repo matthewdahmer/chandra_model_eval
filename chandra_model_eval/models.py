@@ -244,7 +244,6 @@ class ChandraModel:
                  pitch_bin_statistics, dwell_table, analytics).
         Falls back to empty structures and logs a warning on any failure.
         """
-        _empty = ({}, {}, {}, {}, {}, {}, {})
         step = 'import cheta'
         try:
             from cheta import fetch_eng
@@ -252,7 +251,7 @@ class ChandraModel:
             plist = get_pitch_midpoints(model)
             if not plist:
                 telem_bounds = (float(np.nanmin(dvals)), float(np.nanmax(dvals)))
-                return [], *_empty, telem_bounds
+                return [], {}, {}, {}, {}, telem_bounds, {}, {}, {}
             step = 'get_npnt_state_data'
             state_data = get_npnt_state_data(tstart, tstop)
             step = 'bin_data_by_pitch'
@@ -308,7 +307,7 @@ class ChandraModel:
                 step, self.msid, exc, traceback.format_exc(),
             )
             telem_bounds = (float(np.nanmin(dvals)), float(np.nanmax(dvals)))
-            return [], *_empty, telem_bounds
+            return [], {}, {}, {}, {}, telem_bounds, {}, {}, {}
 
     def _compute_solar_params(self, model):
         """Return list of solarheat component dicts. Falls back to [] on failure."""
@@ -562,7 +561,7 @@ class ModelPM1THV2T(ChandraModel):
 
 
 class ModelPM2THV1T(ChandraModel):
-    """pm2thv1t spec contains no limits; limit must be passed explicitly."""
+    """MUPS-2A valve temperature (degF)."""
     def __init__(self, model_spec, limit=None):
         self.msid = 'pm2thv1t'
         self.limit_type = 'max'
@@ -759,9 +758,10 @@ def run_all_models(tstart, tstop, outdir, models_root, limit_overrides=None, mod
         Root path of the chandra_models repository checkout.  Model spec paths
         are constructed as ``{models_root}/{MODEL_SPECS[msid]}``.
     limit_overrides : dict, optional
-        MSID → explicit limit value.  Required for models whose spec files
-        contain no planning.warning limit (currently only 'pm2thv1t').
-        Any model can be overridden here; others use the spec default.
+        MSID → explicit limit value, replacing the spec's planning.warning
+        limit.  Optional for all current specs; required only for a spec with
+        no planning.warning limit.
+        Models not listed use the spec default.
     models : list of str, optional
         Subset of MSIDs to evaluate.  Defaults to all 14 models in MODELS.
     spec_overrides : dict, optional
